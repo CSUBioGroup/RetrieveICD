@@ -1,4 +1,4 @@
-# tehRetrieve and Rank 
+# Retrieve and Rank 
 
 Retrieve and Rerank for Automated ICD Coding via Contrastive Learning
 
