@@ -10,7 +10,7 @@ from math import floor
 from tqdm import tqdm
 from pytorch_lamb import lamb
 from sklearn.metrics import roc_auc_score
-
+from transformers import AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
 class FGM():
     def __init__(self, model, emb_name='emb'):
@@ -35,6 +35,7 @@ class FGM():
                 assert name in self.backup
                 param.data = self.backup[name]
         self.backup = {}
+
 
 class EMA():
     def __init__(self, model, decay):
@@ -69,6 +70,7 @@ class EMA():
                 param.data = self.backup[name]
         self.backup = {}
 
+
 class BaseModel:
     def __init__(self):
         pass
@@ -77,7 +79,7 @@ class BaseModel:
     def train(self, dataClass, batchSize, epoch, 
               lr=0.001, momentum=0.9, weightDecay=0.0, stopRounds=10, threshold=0.2, earlyStop=10, 
               savePath='model/KAICD', saveRounds=1, isHigherBetter=True, metrics="MiF", report=["ACC", "MiF"], 
-              optimType='Adam',schedulerType='cosine',eta_min=0,warmup_ratio=0.1,dataEnhance=False, dataEnhanceRatio=0.0, attackTrain=False, attackLayerName='emb',ema_para = -1,candidate_para=False):
+              optimType='Adam',schedulerType='cosine',warmup_ratio=0.1,dataEnhance=False, dataEnhanceRatio=0.0, attackTrain=False, attackLayerName='emb',ema_para = -1):
         dataClass.dataEnhance = dataEnhance
         dataClass.dataEnhanceRatio = dataEnhanceRatio
 
@@ -90,19 +92,19 @@ class BaseModel:
 
         metrictor = Metrictor(dataClass.classNum)
 
-        trainStream = dataClass.random_batch_data_stream(batchSize=batchSize, type='train', device=self.device,candidate=candidate_para)
+        trainStream = dataClass.random_batch_data_stream(batchSize=batchSize, type='train', device=self.device)
 
         itersPerEpoch = (dataClass.trainSampleNum+batchSize-1)//batchSize
 
         num_training_steps = itersPerEpoch*epoch
         num_warmup_steps = int(warmup_ratio*itersPerEpoch*epoch)
   
-        optimizer,schedulerRLR = self.get_optimizer(optimType, schedulerType, lr, weightDecay, momentum, num_training_steps,num_warmup_steps,eta_min)
+        optimizer,schedulerRLR = self.get_optimizer(optimType, schedulerType, lr, weightDecay, momentum, num_training_steps,num_warmup_steps)
         
         mtc,bestMtc,stopSteps = 0.0,-1,0
 
         if dataClass.validSampleNum>0:
-            validStream = dataClass.random_batch_data_stream(batchSize=batchSize, type='valid', device=self.device,candidate=candidate_para)
+            validStream = dataClass.random_batch_data_stream(batchSize=batchSize, type='valid', device=self.device)
  
         st = time.time()
         
@@ -116,8 +118,8 @@ class BaseModel:
             pbar = tqdm(range(itersPerEpoch))
             for i in pbar:
                 self.to_train_mode()
-                X, Y, candidate= next(trainStream)
-                loss = self._train_step(X, Y,candidate,optimizer, attackTrain, isBeginEMA)
+                X, Y, Candidate= next(trainStream)
+                loss = self._train_step(X, Y, optimizer, attackTrain, isBeginEMA)
                 if schedulerRLR !=None:
                     schedulerRLR.step()
                 pbar.set_description(f"Epoch {e} - Training Loss: {loss.data:.3f}")
@@ -133,12 +135,12 @@ class BaseModel:
                     print(" speed: %.3lf items/s; remaining time: %.3lfs;"%(speed, restNum/speed))
             
             if dataClass.validSampleNum>0 and (e+1)%saveRounds==0:
+                # 4. validation
                 if isBeginEMA:
                     self.ema.apply_shadow()
                 self.to_eval_mode()
                 print('[Total Valid]', end='')
-                Y_pre,Y = self.calculate_y_prob_by_iterator(dataClass.one_epoch_batch_data_stream(batchSize, type='valid', device=self.device,candidate=candidate_para))
-                
+                Y_pre,Y = self.calculate_y_prob_by_iterator(dataClass.one_epoch_batch_data_stream(batchSize, type='valid', device=self.device))
                 metrictor.set_data(Y_pre, Y, threshold)
                 res = metrictor(report)
                 mtc = res[metrics]
@@ -161,11 +163,11 @@ class BaseModel:
         with torch.no_grad():
             print(f'============ Result ============')
             print(f'[Total Train]',end='')
-            Y_pre,Y = self.calculate_y_prob_by_iterator(dataClass.one_epoch_batch_data_stream(batchSize, type='train', device=self.device,candidate=candidate_para))
+            Y_pre,Y = self.calculate_y_prob_by_iterator(dataClass.one_epoch_batch_data_stream(batchSize, type='train', device=self.device))
             metrictor.set_data(Y_pre, Y, threshold)
             metrictor(report)
             print(f'[Total Valid]',end='')
-            Y_pre,Y = self.calculate_y_prob_by_iterator(dataClass.one_epoch_batch_data_stream(batchSize, type='valid', device=self.device,candidate=candidate_para))
+            Y_pre,Y = self.calculate_y_prob_by_iterator(dataClass.one_epoch_batch_data_stream(batchSize, type='valid', device=self.device))
             metrictor.set_data(Y_pre, Y, threshold)
             res = metrictor(report)
             print(f'================================')
@@ -203,16 +205,16 @@ class BaseModel:
             dataClass.id2icd,dataClass.icd2id = parameters['icd2id'],parameters['id2icd']     
         print("%d epochs and %.3lf val Score 's model load finished."%(parameters['epochs'], parameters['bestMtc']))
     
-    def calculate_y_prob(self, X, candidate):
-        Y_pre = self.calculate_y_logit(X,candidate)['y_logit']
+    def calculate_y_prob(self, X):
+        Y_pre = self.calculate_y_logit(X)['y_logit']
         return torch.sigmoid(Y_pre)
     def calculate_y(self, X, threshold=0.2):
         Y_pre = self.calculate_y_prob(X)
         isONE = Y_pre>threshold
         Y_pre[isONE],Y_pre[~isONE] = 1,0
         return Y_pre
-    def calculate_loss(self, X, Y, candidate):
-        out = self.calculate_y_logit(X,candidate)
+    def calculate_loss(self, X, Y):
+        out = self.calculate_y_logit(X)
         Y_logit = out['y_logit']
         
         addLoss = 0.0
@@ -227,10 +229,10 @@ class BaseModel:
         YArr,Y_preArr = [],[]
         while True:
             try:
-                X,Y,candidate = next(dataStream)
+                X,Y = next(dataStream)
             except:
                 break
-            Y_pre,Y = self.calculate_y_prob(X,candidate).cpu().data.numpy().astype(np.float16),Y.cpu().data.numpy().astype(np.int32)
+            Y_pre,Y = self.calculate_y_prob(X).cpu().data.numpy().astype(np.float16),Y.cpu().data.numpy().astype(np.int16)
             YArr.append(Y)
             Y_preArr.append(Y_pre)
         YArr,Y_preArr = np.vstack(YArr),np.vstack(Y_preArr)
@@ -246,14 +248,14 @@ class BaseModel:
     def to_eval_mode(self):
         for module in self.moduleList:
             module.eval()
-    def _train_step(self, X, Y,candidate, optimizer, attackTrain,isBeginEMA):
-        loss = self.calculate_loss(X, Y, candidate)
+    def _train_step(self, X, Y, optimizer, attackTrain,isBeginEMA):
+        loss = self.calculate_loss(X, Y)
         loss.backward()
         if attackTrain:
-            self.fgm.attack() # 在embedding上添加对抗梯度
-            lossAdv = self.calculate_loss(X, Y,candidate)
-            lossAdv.backward() # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
-            self.fgm.restore() # 恢复embedding参数
+            self.fgm.attack() 
+            lossAdv = self.calculate_loss(X, Y)
+            lossAdv.backward() 
+            self.fgm.restore()
         nn.utils.clip_grad_norm_(self.moduleList.parameters(), max_norm=20, norm_type=2)
         optimizer.step()
         if isBeginEMA:
@@ -261,15 +263,16 @@ class BaseModel:
         optimizer.zero_grad()
         return loss
 
-    def get_optimizer(self, optimType, schedulerType, lr, weightDecay, momentum,num_training_steps,num_warmup_steps,eta_min):     
+    def get_optimizer(self, optimType, schedulerType, lr, weightDecay, momentum,num_training_steps,num_warmup_steps):     
         
         # Prepare optimizer and schedule (linear warmup and decay)
+        # model_lr={'others':lr, 'flash':0.0007}
         model_lr={'others':lr}
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = []
         for layer_name in model_lr:
             lr = model_lr[layer_name]    
-            if layer_name != 'others':  
+            if layer_name != 'others':  # 设定了特定 lr 的 layer
                  optimizer_grouped_parameters += [
                     {
                         "params": [p for n, p in self.moduleList.named_parameters() if (not any(nd in n for nd in no_decay) 
@@ -317,39 +320,84 @@ class BaseModel:
         if schedulerType=='cosine':
             schedulerRLR = get_cosine_schedule_with_warmup(optimizer, num_training_steps=num_training_steps, num_warmup_steps=num_warmup_steps)        
         elif schedulerType=='cosine_Anneal':
-            schedulerRLR = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 5, T_mult=3,eta_min=eta_min)
+            schedulerRLR = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 5, 3)
         elif schedulerType=='None':
             schedulerRLR = None
-
+        
         return optimizer, schedulerRLR
 
-class FLASH_ICD_Candidates_2Inputs(BaseModel):
+
+class DeepLabeler_Contrast(BaseModel):
+    def __init__(self, classNum, noteEmbedding, docEmbedding, labDescVec,
+                 cnnHiddenSize=64, contextSizeList=[3,4,5],
+                 docHiddenSize=64, dropout=0.75, device=torch.device('cuda:0'),temp_para=0.1):
+        self.noteEmbedding = TextEmbedding(noteEmbedding, freeze=False, dropout=dropout, name='noteEmbedding').to(device)
+        self.docEmbedding = TextEmbedding(docEmbedding, freeze=True, dropout=dropout, name='docEmbedding').to(device)
+        self.textCNN = TextCNN(noteEmbedding.shape[1], cnnHiddenSize, contextSizeList).to(device)
+        self.docFcLinear = MLP(docEmbedding.shape[1], docHiddenSize, name='docFcLinear').to(device)
+        self.labDescVec = nn.Embedding.from_pretrained(torch.tensor(labDescVec, dtype=torch.float32), freeze=False).to(device)
+        self.labDescVec.name = 'labDescVec'
+        self.fcLinear = MLP(cnnHiddenSize*len(contextSizeList)+docHiddenSize, classNum, name='fcLinear').to(device)
+        self.moduleList = nn.ModuleList([self.noteEmbedding, self.docEmbedding, self.textCNN, self.docFcLinear, self.fcLinear,
+                                         self.labDescVec])
+        self.device = device
+        self.temp_para = temp_para
+
+    def calculate_y_logit(self, input):
+        x1 = input['noteArr']
+        x1 = self.noteEmbedding(x1)
+        x1 = self.textCNN(x1)   # batchSize * cnnHiddenSize * 3    3=len(contextSizeList)
+        x2 = input['noteIdx']
+        x2 = self.docEmbedding(x2)
+        x2 = self.docFcLinear(x2)   # batchSize * docHiddenSize(128)
+        x = torch.cat([x1,x2], dim=1)                               # cnnHiddenSize*len(contextSizeList)+docHiddenSize
+        similarity_distribution = torch.matmul(x, self.labDescVec.weight.transpose(0, 1)) / (torch.sqrt(torch.sum(x ** 2, dim=1, keepdim=True)) * torch.sqrt(torch.sum(self.labDescVec.weight ** 2, dim=1, keepdim=True)).transpose(0, 1))  # batchSize x ClassNum
+
+        return {'note_vec': x, 'similarity': similarity_distribution}   # batchSize x ClassNum
+
+    def calculate_loss(self, X, Y):
+        out = self.calculate_y_logit(X)
+        similarity_distribution = out['similarity']
+        return self.loss_with_ContraLearning(similarity_distribution, Y)
+
+    def loss_with_ContraLearning(self,similarity_distribution, Y):
+        below_fraction = torch.exp(similarity_distribution / self.temp_para).sum(dim=1,keepdim=True)
+        he_1 = (torch.log(torch.exp(similarity_distribution / self.temp_para) /below_fraction)* Y).sum(dim=1, keepdim=True)
+        cnt_label = Y.sum(dim=1,keepdim=True)
+        aw = torch.mean(-1*he_1/cnt_label)
+        return aw
+
+    def calculate_y_prob(self, X):
+        Y_pre = self.calculate_y_logit(X)['similarity']     # -1 ~ 1
+        Y_pre = (Y_pre+1)/2
+        return Y_pre      
+
+
+class FLASH_ICD_FULL(BaseModel):
     def __init__(self,classNum,embedding,labDescVec,seqMaxLen,chunk_length,trans_s,attnList=[],
-                 embDropout=0.2, hdnDropout=0.2,Dropout=0.3, fcDropout=0.5, numLayers=1, device=torch.device('cuda:0'), useCircleLoss=False, compress=False):
+                 embDropout=0.2, hdnDropout=0.2, fcDropout=0.5, numLayers=1, device=torch.device('cuda:0'), useCircleLoss=False, compress=False):
         self.embedding = TextEmbedding_1d(embedding, dropout=embDropout).to(device)
         self.labDescVec = torch.tensor(labDescVec, dtype=torch.float32).to(device)
         self.FLASH = FLASH(seqMaxLen, embedding.shape[1], numLayers,chunk_length,trans_s).to(device)
-        self.icdAttn = DeepICDDescCandiAttention(embedding.shape[1]*2, classNum, labDescVec.shape[1], hdnDropout=hdnDropout, attnList=attnList, labDescVec=labDescVec).to(device)
+        self.icdAttn = DeepICDDescAttention(embedding.shape[1], classNum, labDescVec.shape[1], hdnDropout=hdnDropout, attnList=attnList, labDescVec=labDescVec).to(device)
         self.fcLinear = MLP(labDescVec.shape[1], 1, [], dropout=fcDropout).to(device)       
         self.moduleList = nn.ModuleList([self.embedding,self.FLASH,self.icdAttn,self.fcLinear])
         self.crition = nn.MultiLabelSoftMarginLoss() if not useCircleLoss else MultiLabelCircleLoss()
         self.device = device
         self.hdnDropout = hdnDropout
         self.fcDropout = fcDropout
-        self.classNum = classNum
-    def calculate_y_logit(self, input,candidate):
+    def calculate_y_logit(self, input):
         x = input['noteArr']
-        x = self.embedding(x)                   # => batchSize × seqLen × embSize
-        # Linear Transformer
-        x = self.FLASH(x)                         # => batchSize × SeqLen × embSize
-        # x = self.LNandDP(x) # => batchSize × seqLen X embSize
-
-        x = self.icdAttn(x,candidate)                     # => batchSize × Candidates Num (1000) × inSize
-        x = self.fcLinear(x).squeeze(dim=2)     # => batchSize × Candidates Num (1000)
-        return {'y_logit':x}
-
-    def calculate_y_prob(self, X, candidate):
-        Y_pre_Candidates = torch.sigmoid(self.calculate_y_logit(X,candidate)['y_logit'])
-        Zero_matrix = torch.zeros(Y_pre_Candidates.size(0),self.classNum,device=self.device)
-        Y_pre = Zero_matrix.scatter_(dim=1,index=torch.tensor(candidate,device=self.device),src=Y_pre_Candidates.to(self.device))
-        return Y_pre     
+        if torch.cuda.device_count() > 1:
+            x = nn.parallel.data_parallel(self.embedding,x) 
+            x = nn.parallel.data_parallel(self.FLASH,x)
+            x = nn.parallel.data_parallel(self.icdAttn,x)
+            x = nn.parallel.data_parallel(self.fcLinear,x).squeeze(dim=2)
+        else:
+            x = self.embedding(x)                   # => batchSize × seqLen × embSize
+            # Linear Transformer
+            x = self.FLASH(x)                         # => batchSize × SeqLen × embSize
+            x = self.icdAttn(x)                     # => batchSize × classNum × inSize
+            x = self.fcLinear(x).squeeze(dim=2)     # => batchSize × classNum
+        return {'y_logit':x}        
+  
