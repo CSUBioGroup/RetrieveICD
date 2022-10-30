@@ -1,4 +1,4 @@
-# Retrieve and Rank 
+# tehRetrieve and Rank 
 
 Retrieve and Rerank for Automated ICD Coding via Contrastive Learning
 
@@ -61,8 +61,7 @@ semantic features of EMRs.
 `without candidates:`
 
 ```python
-model_FLASH= FLASH_ICD_Candidates_2Inputs(dataClass.classNum, dataClass.vector['noteEmbedding'],labDescVec,seqMaxLen=4000,chunk_length=400, trans_s = 300,attnList=[512],embDropout=0.2, hdnDropout=0.2,Dropout=0.0, fcDropout=0.0,numLayers=2,device=torch.device("cuda:0"))
-
+model_FLASH= FLASH_ICD_FULL(dataClass.classNum, dataClass.vector['noteEmbedding'],labDescVec,seqMaxLen=4000,chunk_length=400, trans_s=300,attnList=[512],embDropout=0.2, hdnDropout=0.2, fcDropout=0.0,numLayers=2,device=torch.device("cuda:0"))
 savePath = 'Replace with your path'
 res = model_FLASH.train(dataClass, batchSize=64, epoch=128,
             lr= 0.003,stopRounds=-1, threshold=0.5, earlyStop=64, optimType='Lamb',schedulerType='cosine_Anneal',eta_min=0.0,
@@ -78,5 +77,15 @@ savePath = 'Replace with your path'
 res = model_FLASH_Stage2.train(dataClass, batchSize=64, epoch=128,
             lr= 0.003,stopRounds=-1, threshold=0.5, earlyStop=64, optimType='Lamb',schedulerType='cosine_Anneal',eta_min=0.0,
             savePath=savePath,dataEnhance=True, dataEnhanceRatio=0.2, attackTrain=True, metrics="MiF", report=[ "MiAUC","MiF","P@5","P@8","P@15"], candidate_para=candi_t)
+```
+
+## Make final prediction
+
+Change `dataClass` load path to where your preprocessed dataClass located.
+
+Change model weight path to where your model saved.
+
+```python
+python inference.py
 ```
 
