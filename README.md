@@ -16,6 +16,7 @@ from DL_ClassifierModel_stage2_2input import *
 
 ## Retrieval: Generate Candidates in 1st Stage
 
+Generate the document vector for DeepLabeler:
 ```python
 labDescVec = -1+2*np.random.random((dataClass.icdNum,1024))
 model = DeepLabeler_Contrast(dataClass.classNum, dataClass.vector['noteEmbedding'], docEmbedding, labDescVec,cnnHiddenSize=256, contextSizeList=[3,4,5],
@@ -27,6 +28,15 @@ model.train(dataClass, batchSize=128, epoch=128,
 ```
 
 #### Retrieve the closest ICD codes as candidates and forward them to the next stage：
+
+```python
+from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+
+vector_size = 256
+documents = [TaggedDocument(doc, [i]) for i, doc in enumerate(dataClass.rawNOTE)]
+model_doc2vec = Doc2Vec(documents, vector_size=vector_size, window=7, min_count=1, workers=4)
+docEmbedding = np.array([model_doc2vec.infer_vector(i) for i in dataClass.rawNOTE], dtype=np.float32)
+```
 
 ```python
 Candidate_num = 1000
